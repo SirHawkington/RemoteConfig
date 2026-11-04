@@ -164,14 +164,15 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 }
 
 func readJSON(r *http.Request, v any) error {
-	var body io.Reader = http.MaxBytesReader(nil, r.Body, 4<<20)
+	const maxJSON = 4 << 20
+	var body io.Reader = http.MaxBytesReader(nil, r.Body, maxJSON)
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
 		gz, err := gzip.NewReader(body)
 		if err != nil {
 			return err
 		}
 		defer gz.Close()
-		body = gz
+		body = io.LimitReader(gz, maxJSON) // cap the decompressed size too (gzip bomb)
 	}
 	return json.NewDecoder(body).Decode(v)
 }

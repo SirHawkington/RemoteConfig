@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -26,7 +27,7 @@ func (a *Agent) serveLocal(ctx context.Context) {
 	mux.HandleFunc("GET /v1/lifecycle", a.auth(a.localLifecycle))
 	mux.HandleFunc("POST /v1/config/ack", a.auth(func(w http.ResponseWriter, r *http.Request) {
 		var ack proto.ConfigAck
-		json.NewDecoder(r.Body).Decode(&ack)
+		json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&ack)
 		a.logf("app acked config revision %d ok=%v %s", ack.Revision, ack.OK, ack.Error)
 		if ack.OK {
 			a.mu.Lock()
@@ -82,7 +83,8 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func (a *Agent) auth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") != a.localToken {
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if a.localToken == "" || subtle.ConstantTimeCompare([]byte(got), []byte(a.localToken)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid local token"})
 			return
 		}

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	crand "crypto/rand"
+	"encoding/hex"
 	"math/rand"
 	"net"
 	"net/http"
@@ -234,7 +236,11 @@ func (a *Agent) loadLocalToken() error {
 		a.localToken = strings.TrimSpace(string(b))
 		return nil
 	}
-	tok := fmt.Sprintf("%016x%016x", rand.Uint64(), rand.Uint64())
+	raw := make([]byte, 32)
+	if _, err := crand.Read(raw); err != nil {
+		return err
+	}
+	tok := hex.EncodeToString(raw)
 	a.localToken = tok
 	return os.WriteFile(p, []byte(tok), 0o600)
 }

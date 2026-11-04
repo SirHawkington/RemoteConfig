@@ -1,0 +1,26 @@
+# Build output
+/bin/
+*.exe
+*.exe~
+*.test
+*.out
+
+# Runtime state: never commit these.
+# signing.json holds the server's private signing key; the databases and agent state hold
+# device tokens, password hashes and uploaded screenshots.
+signing.json
+*.db
+*.db-shm
+*.db-wal
+/artifacts/
+/agent-state/
+server-ui.json
+/data/
+
+# Local tooling and editor files
+.claude/
+.vs/
+.vscode/
+.idea/
+*.log
+Thumbs.db

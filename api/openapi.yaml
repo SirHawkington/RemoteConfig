@@ -1,0 +1,1744 @@
+openapi: 3.0.3
+info:
+  title: RemoteConfig API (placeholder name)
+  version: 0.1.0
+  description: |
+    Two surfaces share one contract style (JSON over HTTP):
+
+    * **App-facing / device API** (`/v1/...`): served by the server AND by the local
+      agent on `http://127.0.0.1:<port>`. An app only chooses a base URL. See DESIGN.md 6.9.
+    * **Admin API** (`/v1/admin/...`): server only. Used by the dashboard and automation.
+
+    Conventions
+    * All bodies are JSON (UTF-8). Request bodies >1 KB may be sent `Content-Encoding: gzip`.
+    * Timestamps are RFC 3339 UTC strings.
+    * Config revision is a monotonically increasing integer per device; `ETag` is the
+      content hash of the effective config.
+servers:
+  - url: http://127.0.0.1:7878/v1
+    description: Local agent (relay)
+  - url: https://remoteconfig.example.com/v1
+    description: Remote server (direct)
+
+tags:
+  - name: enrollment
+  - name: device
+  - name: config
+  - name: status
+  - name: telemetry
+  - name: commands
+  - name: artifacts
+  - name: accounts
+  - name: admin
+
+security:
+  - deviceToken: []
+
+paths:
+  /enroll:
+    post:
+      tags: [enrollment]
+      summary: Exchange a one-time enrollment token for a device credential
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EnrollRequest' }
+      responses:
+        '201':
+          description: Enrolled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrollResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /checkin:
+    post:
+      tags: [device]
+      summary: Periodic agent check-in (compact status in, changes out)
+      description: |
+        Agent -> server only. Keep the request < ~2 KB. The response tells the agent
+        what changed: a new desired config revision, pending commands, and the next
+        schedule. Safe to retry (idempotent per `seq`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckinRequest' }
+      responses:
+        '200':
+          description: Server directives
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckinResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /config:
+    get:
+      tags: [config]
+      summary: Effective config for this device (and app)
+      description: |
+        Supports `If-None-Match`; unchanged config returns bodyless `304`.
+        With `wait=<seconds>` the call long-polls until the config changes or the
+        timeout elapses (then `304`).
+      parameters:
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+        - name: wait
+          in: query
+          description: Long-poll seconds (0-60)
+          schema: { type: integer, minimum: 0, maximum: 60, default: 0 }
+      responses:
+        '200':
+          description: |
+            Effective config. A request with `Accept: application/vnd.remoteconfig.signed+json`
+            (what the agent sends) gets the signed form: an envelope whose payload is a
+            `SignedConfig`. The agent verifies it before applying anything.
+          headers:
+            ETag:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EffectiveConfig' }
+            application/vnd.remoteconfig.signed+json:
+              schema: { $ref: '#/components/schemas/SignedEnvelope' }
+        '304': { description: Not modified }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /scripts/{id}:
+    get:
+      tags: [commands]
+      summary: Fetch the bytes of a script named in a signed `run_script` command
+      description: |
+        Only scripts of the device's own project. The agent compares the SHA-256 of what it
+        received with the hash in the signed command and runs nothing that does not match.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The script
+          content:
+            application/octet-stream: { schema: { type: string, format: binary } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /releases/{id}/file:
+    get:
+      tags: [commands]
+      summary: Download a release named in a signed `apply_release` command
+      description: |
+        Supports `Range` requests, so an interrupted download resumes. Only releases of the
+        device's own project. The agent checks size and SHA-256 against the signed command
+        before it unpacks or executes anything.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: Range, in: header, schema: { type: string, example: 'bytes=1048576-' } }
+      responses:
+        '200': { description: The whole file, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '206': { description: The requested part }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /server-key:
+    get:
+      tags: [config]
+      summary: The current signing key (public, no authentication)
+      description: An agent with a pinned key compares it before it presents its one-time enrollment token.
+      security: []
+      responses:
+        '200':
+          description: Current key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyInfo' }
+
+  /keys:
+    get:
+      tags: [config]
+      summary: The server's signing keys and the endorsements that link them
+      description: |
+        Public keys only. After a rotation each new key carries an endorsement signed by the
+        key before it, which is how an agent that trusts only the old key follows the change.
+      responses:
+        '200':
+          description: Key set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeySet' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /lifecycle:
+    get:
+      tags: [config]
+      summary: Learn that the agent wants the app to shut down (local agent API only)
+      description: |
+        Long-poll. The app calls this in the background; it returns `204` while nothing is
+        requested, and `200` with `{"action":"quit"}` once the agent wants the app to exit
+        (a restart, a scheduled restart, a config change, a stopped agent). The app should
+        save its state and exit within `grace_s`; after that the agent kills it. The request
+        stays pending until the process exits, so a late poll still sees it.
+
+        The agent also sends WM_CLOSE to the app's window, which Unity turns into a normal
+        quit, so apps that never call this still close politely.
+      parameters:
+        - name: wait
+          in: query
+          description: Long-poll seconds (0-60)
+          schema: { type: integer, minimum: 0, maximum: 60, default: 0 }
+      responses:
+        '200':
+          description: The app should quit
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  action: { type: string, enum: [quit] }
+                  reason: { type: string }
+                  grace_s: { type: integer, description: Seconds until the agent kills the app }
+        '204': { description: Nothing requested }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /config/ack:
+    post:
+      tags: [config]
+      summary: Report that a config revision was applied (or failed)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigAck' }
+      responses:
+        '204': { description: Recorded }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /status:
+    put:
+      tags: [status]
+      summary: App heartbeat / status (latest value wins)
+      description: |
+        Called by the app every ~5-15 s against the local agent (cheap, never leaves the
+        machine), or directly against the server at a slower rate when no agent is used.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppStatus' }
+      responses:
+        '204': { description: Recorded }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      tags: [status]
+      summary: Read back last known status (local agent API; useful for local dashboard)
+      responses:
+        '200':
+          description: Current status snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceStatus' }
+
+  /events:
+    post:
+      tags: [telemetry]
+      summary: Batched events / log lines
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events:
+                  type: array
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/Event' }
+      responses:
+        '202': { description: Accepted (queued if offline) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /metrics:
+    post:
+      tags: [telemetry]
+      summary: Batched key/value metrics
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [metrics]
+              properties:
+                metrics:
+                  type: array
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/Metric' }
+      responses:
+        '202': { description: Accepted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /commands:
+    get:
+      tags: [commands]
+      summary: Pending commands for this device
+      responses:
+        '200':
+          description: List (may be empty)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Command' }
+  /commands/{id}/result:
+    post:
+      tags: [commands]
+      summary: Report a command result
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommandResult' }
+      responses:
+        '204': { description: Recorded }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /artifacts:
+    post:
+      tags: [artifacts]
+      summary: Begin, or resume, a resumable artifact upload (screenshot, log bundle)
+      description: |
+        Server only (the local agent produces artifacts itself and does not relay them).
+
+        Idempotent per (`device`, `client_id`): if a retry arrives after a lost response, the
+        same session comes back with the server's current `offset`, so no byte is sent twice.
+        Upload the bytes with `PATCH /artifacts/{id}`; the server verifies `sha256` when the
+        last byte arrives. Limits: 25 MB per artifact, 1 MB per chunk, 50 unfinished uploads
+        per device.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ArtifactInit' }
+      responses:
+        '200':
+          description: Existing session for this client_id (resume from `offset`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArtifactSession' }
+        '201':
+          description: New upload session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArtifactSession' }
+        '400': { description: Invalid request (missing client_id, bad kind or checksum) }
+        '413': { description: Larger than 25 MB }
+        '429': { description: Too many unfinished uploads }
+  /artifacts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    head:
+      tags: [artifacts]
+      summary: Query how many bytes the server has (resume point)
+      responses:
+        '200':
+          description: Current state of the upload
+          headers:
+            Upload-Offset:
+              description: Bytes received so far (the resume point)
+              schema: { type: integer }
+            Upload-Complete:
+              schema: { type: boolean }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [artifacts]
+      summary: Append bytes at `Upload-Offset`
+      description: |
+        The offset must equal the bytes the server already has. On a mismatch the server
+        answers 409 with its own `Upload-Offset` and the client continues from there.
+        Re-sending the final chunk of a completed upload is harmless (204, complete).
+      parameters:
+        - name: Upload-Offset
+          in: header
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '204':
+          description: Chunk stored
+          headers:
+            Upload-Offset:
+              description: New offset
+              schema: { type: integer }
+            Upload-Complete:
+              description: '"true" once the last byte arrived and the checksum matched'
+              schema: { type: boolean }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Offset mismatch; continue from the returned Upload-Offset
+          headers:
+            Upload-Offset:
+              schema: { type: integer }
+        '413': { description: Chunk larger than 1 MB, or runs past the declared size }
+        '422': { description: Checksum mismatch; the upload was discarded }
+
+  # ---------------------------------------------------------------- admin
+  /auth/login:
+    post:
+      tags: [accounts]
+      security: []
+      summary: Sign in with a username and password
+      description: |
+        Five failed attempts for one account from one address, or thirty from one address,
+        lock that key for 15 minutes (`429` with `Retry-After`). Unknown user, wrong password,
+        disabled account and token-only account all answer the same `401`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200':
+          description: A session token (idle expiry 7 days, absolute 30 days) and who you are
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+                  user: { $ref: '#/components/schemas/UserView' }
+                  projects: { type: array, items: { $ref: '#/components/schemas/ProjectView' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { description: Too many failed attempts }
+
+  /auth/logout:
+    post:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: End this dashboard session
+      responses:
+        '204': { description: Signed out }
+
+  /admin/me:
+    get:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Who am I, and which projects can I see (with my role in each)
+      responses:
+        '200':
+          description: The caller
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/UserView' }
+                  projects: { type: array, items: { $ref: '#/components/schemas/ProjectView' } }
+
+  /admin/me/password:
+    post:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Change my password (signs my other dashboard sessions out)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current, new]
+              properties:
+                current: { type: string }
+                new: { type: string, minLength: 10, maxLength: 200 }
+      responses:
+        '204': { description: Changed }
+        '400': { description: The new password is too weak }
+        '403': { description: The current password is wrong }
+
+  /admin/me/tokens:
+    get:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: My personal access tokens (never the secrets)
+      responses:
+        '200':
+          description: Tokens
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TokenInfo' }
+    post:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Create a personal access token for scripts
+      description: The secret is returned once. It acts as you, with your roles.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                ttl_days: { type: integer, minimum: 0, maximum: 3650, description: 0 = never expires }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  name: { type: string }
+                  token: { type: string, description: Shown only now }
+                  expires_at: { type: string, format: date-time }
+
+  /admin/me/tokens/{id}:
+    delete:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Revoke one of my tokens
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Revoked }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/users:
+    get:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: All accounts and their project roles (server admins only)
+      responses:
+        '200':
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UserView' }
+        '403': { description: Needs a server administrator }
+    post:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Create an account (server admins only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, description: "2-40 characters: letters, digits, . _ - @" }
+                display_name: { type: string }
+                password: { type: string, minLength: 10 }
+                is_admin: { type: boolean }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/UserView' } } } }
+        '409': { description: Username taken }
+
+  /admin/users/{username}:
+    parameters:
+      - { name: username, in: path, required: true, schema: { type: string } }
+    patch:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Change display name, admin flag, disabled flag, or reset the password (server admins only)
+      description: |
+        Resetting the password signs the user out of every dashboard session; disabling
+        revokes their sessions and personal access tokens. The last enabled server
+        administrator cannot be demoted or disabled (`409`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                is_admin: { type: boolean }
+                disabled: { type: boolean }
+                password: { type: string, minLength: 10 }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/UserView' } } } }
+        '409': { description: Would leave no enabled server administrator }
+    delete:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Delete an account (server admins only; not yourself, not the last admin)
+      responses:
+        '204': { description: Deleted }
+        '409': { description: Would leave no enabled server administrator }
+
+  /admin/audit:
+    get:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Who did what, newest first
+      description: |
+        With `project`, that project's entries (project admin role needed). Without it, the
+        whole server's log including sign-ins (server admins only). Config values and
+        passwords are never recorded, only which parts changed.
+      parameters:
+        - { name: project, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, maximum: 1000 } }
+      responses:
+        '200':
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEntry' }
+
+  /admin/projects/{project}/members:
+    get:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Members of a project and their roles (project admin)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Member' }
+
+  /admin/projects/{project}/members/{username}:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+      - { name: username, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Give an existing account a role in the project (project admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string, enum: [viewer, operator, admin] }
+      responses:
+        '200': { description: Set, content: { application/json: { schema: { $ref: '#/components/schemas/Member' } } } }
+        '404': { description: No such user }
+    delete:
+      tags: [accounts]
+      security: [{ userToken: [] }]
+      summary: Remove someone from the project (project admin)
+      responses:
+        '204': { description: Removed }
+
+  /admin/projects:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: The projects you have a role in, with that role
+      responses:
+        '200':
+          description: Projects
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProjectView' }
+    post:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Create a project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+
+  /admin/projects/{project}/enrollment-tokens:
+    post:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Create a one-time enrollment token
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tags: { type: array, items: { type: string } }
+                ttl_hours: { type: integer, default: 72 }
+      responses:
+        '201':
+          description: Token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+
+  /admin/projects/{project}/devices:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: List devices with derived status
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DeviceSummary' }
+
+  /admin/projects/{project}/devices/{device}:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Device detail
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: device, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Device
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceSummary' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Rename a device or change its tags (tags select config layers)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: device, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DevicePatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceSummary' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Remove a device and its history (it must re-enroll)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: device, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Removed }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/projects/{project}/devices/{device}/detail:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Everything the dashboard shows for one device
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: device, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Device detail (events newest first)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/projects/{project}/devices/{device}/artifacts:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Completed artifacts of a device, newest capture first
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: device, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string, enum: [screenshot, log, other] } }
+        - { name: limit, in: query, schema: { type: integer, default: 60, maximum: 500 } }
+      responses:
+        '200':
+          description: Artifacts. Screenshots carry meta display, width, height, orig_width, orig_height, reason, group (displays of one capture share it) and black.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ArtifactInfo' }
+
+  /admin/projects/{project}/artifacts/{id}:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Download an artifact's bytes
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The file, with its stored content type (immutable; cacheable by the browser)
+          content:
+            '*/*':
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Delete an artifact
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/projects/{project}/devices/{device}/metrics:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Time series of one metric (oldest first)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: device, in: path, required: true, schema: { type: string } }
+        - { name: name, in: query, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 500, maximum: 5000 } }
+      responses:
+        '200':
+          description: Points
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Metric' }
+
+  /admin/projects/{project}/config:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: All config layers of a project, keyed by scope
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Map of scope to document
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { $ref: '#/components/schemas/ConfigDocument' }
+
+  /admin/projects/{project}/config/{scope}:
+    delete:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Delete a config layer
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: scope, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Set the config document for a scope
+      description: |
+        `scope` is `global`, `tag:<name>` or `device:<id>`. Documents deep-merge in that
+        order (device overrides tag overrides global). Bumps the effective revision of
+        every affected device.
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: scope, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigDocument' }
+      responses:
+        '200':
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigDocument' }
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Get the config document for a scope
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: scope, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Document
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigDocument' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/projects/{project}/scripts:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: The project's script library (metadata only)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Newest version of each name first
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ScriptInfo' } }
+    post:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Add a script (project admins)
+      description: |
+        Scripts are immutable. Uploading under an existing name creates the next version.
+        Interpreters: powershell, cmd, bash, sh, python.
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScriptCreate' }
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScriptInfo' }
+
+  /admin/projects/{project}/scripts/{id}/content:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: The text of a script (project admins; scripts can contain secrets)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: The script, content: { text/plain: { schema: { type: string } } } }
+
+  /admin/projects/{project}/scripts/{id}:
+    delete:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Delete a script version (project admins)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Deleted }
+
+  /admin/projects/{project}/releases:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: The project's releases
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Newest first
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ReleaseInfo' } }
+    post:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Upload a release (project admins)
+      description: |
+        The request body is the file itself (streamed to disk, up to 2 GB); the description is
+        in the query. The server computes the SHA-256. An `app` release is a zip of the build
+        folder; an `agent` release is the agent executable, uploaded with the version that
+        `agent version` prints. A version can never be replaced.
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: query, required: true, schema: { type: string, enum: [app, agent] } }
+        - { name: name, in: query, required: true, schema: { type: string } }
+        - { name: version, in: query, required: true, schema: { type: string } }
+        - { name: os, in: query, required: true, schema: { type: string, example: windows } }
+        - { name: arch, in: query, schema: { type: string, example: amd64, default: any }, description: Required for agent releases }
+        - { name: notes, in: query, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReleaseInfo' }
+        '409': { description: That version already exists }
+
+  /admin/projects/{project}/releases/{id}:
+    delete:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Delete a release (project admins)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Deleted }
+
+  /admin/projects/{project}/rollouts:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Recent staged rollouts with each device's progress
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Newest first
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Rollout' } }
+    post:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Send a release or script to many devices in stages (project admins)
+      description: |
+        The first `canary` devices in `devices` get the command at once. When they have all succeeded
+        and then stayed healthy for `soak_s` seconds (no error-level event, signatures accepted, back
+        online), the rest follow, `batch` at a time if set. A failure or an unhealthy canary halts the
+        rollout: nothing further is sent. The whole request is checked first (devices, platforms,
+        release or script), and nothing is sent if any part is wrong.
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RolloutRequest' }
+      responses:
+        '201':
+          description: Started; the canary has its command
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Rollout' }
+
+  /admin/projects/{project}/rollouts/{id}/halt:
+    post:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Stop sending to the devices that have not been told yet (project admins)
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Halted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Rollout' }
+        '409': { description: Already finished }
+
+  /admin/signing:
+    get:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: The signing key set (server administrators)
+      responses:
+        '200':
+          description: Key set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeySet' }
+
+  /admin/signing/rotate:
+    post:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Make a new signing key current (server administrators)
+      description: |
+        The old key signs an endorsement of the new one, so agents pinned to the old key
+        follow the change on their own. Agents that were offline keep working as long as the
+        chain from their pinned key to the current one is intact.
+      responses:
+        '200':
+          description: Key set after rotation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeySet' }
+
+  /admin/projects/{project}/devices/{device}/commands:
+    post:
+      tags: [admin]
+      security: [{ userToken: [] }]
+      summary: Queue a command for a device
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: device, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommandRequest' }
+      responses:
+        '201':
+          description: Queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Command' }
+
+components:
+  securitySchemes:
+    deviceToken:
+      type: http
+      scheme: bearer
+      description: |
+        Per-device credential from `/enroll` (direct-to-server), or the per-install
+        localhost token (local agent API).
+    userToken:
+      type: http
+      scheme: bearer
+      description: |
+        A dashboard session token (from `POST /auth/login`, prefix `rcs_`) or a personal access
+        token (from `POST /admin/me/tokens`, prefix `rct_`). Either acts as its user, with that
+        user's roles. Tokens are stored hashed. A token created with the server's
+        `-admin-token` flag is a personal access token of the `admin` account.
+
+        Roles are per project: **viewer** reads everything; **operator** also sends
+        commands, renames/tags devices and edits config except the `supervisor` section;
+        **admin** can do everything in the project including the supervisor section,
+        enrolment, device removal and members. A **server admin** is admin in every project
+        and also manages accounts and creates projects. A project you have no role in answers
+        `404`; too low a role answers `403`.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credential
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    EnrollRequest:
+      type: object
+      required: [token, hostname, os, arch, agent_version]
+      properties:
+        token: { type: string }
+        hostname: { type: string }
+        os: { type: string, example: windows }
+        arch: { type: string, example: amd64 }
+        agent_version: { type: string }
+        name: { type: string, description: Optional friendly name }
+
+    EnrollResponse:
+      type: object
+      required: [device_id, device_token, project]
+      properties:
+        device_id: { type: string }
+        device_token: { type: string }
+        project: { type: string }
+        tags: { type: array, items: { type: string } }
+        checkin_interval_s: { type: integer }
+        signing:
+          allOf: [{ $ref: '#/components/schemas/KeyInfo' }]
+          description: |
+            The server's current signing key. An agent started with `-server-key` checks it
+            against the pin and refuses to enrol on a mismatch; without a pin it is trusted
+            only over https or loopback.
+
+    SignedEnvelope:
+      type: object
+      description: |
+        Signs the exact `payload` bytes together with `payload_type` (so a signed config can
+        never be replayed as a command or the other way round).
+      required: [payload_type, payload, signatures]
+      properties:
+        payload_type:
+          type: string
+          example: application/vnd.remoteconfig.config+json
+        payload: { type: string, format: byte, description: Base64 of the signed JSON }
+        signatures:
+          type: array
+          items:
+            type: object
+            required: [kid, sig]
+            properties:
+              kid: { type: string }
+              sig: { type: string, format: byte }
+
+    SignedConfig:
+      type: object
+      description: Payload of a signed config envelope.
+      required: [device_id, project, issued_at, config]
+      properties:
+        device_id: { type: string, description: The agent refuses a config issued for another device }
+        project: { type: string }
+        issued_at: { type: string, format: date-time, description: Never goes backwards; an older one is refused (rollback protection) }
+        config: { $ref: '#/components/schemas/EffectiveConfig' }
+
+    SignedCommand:
+      type: object
+      description: Payload of a signed command envelope. The agent acts only on this, never on the unsigned fields beside it.
+      required: [device_id, id, type, expires_at, issued_at]
+      properties:
+        device_id: { type: string }
+        id: { type: string }
+        type: { type: string }
+        params: { type: object, additionalProperties: true }
+        expires_at: { type: string, format: date-time }
+        issued_at: { type: string, format: date-time }
+
+    KeyInfo:
+      type: object
+      required: [kid, public]
+      properties:
+        kid: { type: string }
+        public: { type: string, format: byte, description: Ed25519 public key }
+        endorsement:
+          allOf: [{ $ref: '#/components/schemas/SignedEnvelope' }]
+          description: Signed by the previous key; absent on the first key.
+
+    KeySet:
+      type: object
+      required: [current, keys]
+      properties:
+        current: { type: string }
+        keys:
+          type: array
+          items: { $ref: '#/components/schemas/KeyInfo' }
+
+    TrustReport:
+      type: object
+      description: What the agent trusts, sent with each check-in.
+      required: [state]
+      properties:
+        state: { type: string, enum: [strict, legacy], description: "`strict` refuses unsigned config and commands; `legacy` is an agent with no key yet" }
+        key_id: { type: string, description: Key that signed the config in force }
+        keys_trusted: { type: integer }
+        pinned: { type: boolean, description: The key was given at install rather than learned }
+        rejected: { type: integer, description: Signed items refused since the agent started }
+        last_rejected: { type: string }
+        last_rejected_at: { type: string, format: date-time }
+        last_accepted_at: { type: string, format: date-time, description: A rejection older than this means the device has recovered }
+
+    CheckinRequest:
+      type: object
+      required: [seq, agent_version]
+      properties:
+        session:
+          type: string
+          description: Random id of one agent run. `seq` restarts from 1 when it changes.
+        seq:
+          type: integer
+          description: Monotonic per-session counter; server de-duplicates retries.
+        agent_version: { type: string }
+        config_revision:
+          type: integer
+          description: Revision the device is currently running.
+        config_etag: { type: string }
+        app: { $ref: '#/components/schemas/AppStatus' }
+        system: { $ref: '#/components/schemas/SystemStats' }
+        restarts_since_last: { type: integer }
+        last_heartbeat_age_s: { type: integer }
+        bytes_in:
+          type: integer
+          format: int64
+          description: Bytes received over the network in the current data-budget cycle, counted at the socket (TLS and headers included).
+        bytes_out: { type: integer, format: int64, description: Same, for bytes sent }
+        budget_mb: { type: integer, description: The device's data budget for the cycle (0 = none) }
+        budget_state: { type: string, enum: [none, ok, soft, exhausted] }
+        trust: { $ref: '#/components/schemas/TrustReport' }
+        events:
+          type: array
+          description: Notable events since last acked check-in (small).
+          items: { $ref: '#/components/schemas/Event' }
+
+    CheckinResponse:
+      type: object
+      required: [server_time]
+      properties:
+        server_time: { type: string, format: date-time }
+        desired_revision: { type: integer }
+        desired_etag: { type: string }
+        config_changed:
+          type: boolean
+          description: If true the agent should GET /config now.
+        commands:
+          type: array
+          items: { $ref: '#/components/schemas/Command' }
+        next_checkin_s: { type: integer }
+        profile: { type: string, enum: [normal, metered, minimal] }
+
+    ScreenshotPolicy:
+      type: object
+      additionalProperties: false
+      description: |
+        Part of the effective config (`screenshots`); consumed by the agent, which keeps
+        capturing from its cached copy while offline. Set it in any config layer; layers merge
+        field by field.
+      properties:
+        enabled: { type: boolean, default: false }
+        interval_s: { type: integer, minimum: 10, default: 300, description: Scheduled capture period }
+        max_width: { type: integer, minimum: 64, maximum: 7680, default: 1280, description: Each display is downscaled to at most this width }
+        quality: { type: integer, minimum: 1, maximum: 100, default: 60, description: JPEG quality }
+        on_event: { type: boolean, default: false, description: Also capture when the app hangs or crashes (at most once a minute) }
+        upload_unchanged: { type: boolean, default: false, description: If false, a display that looks the same as its last upload is skipped }
+        unchanged_every_s: { type: integer, default: 3600, description: Even if unchanged, send one at least this often }
+
+    BudgetPolicy:
+      type: object
+      additionalProperties: false
+      description: |
+        Part of the effective config (`budget`). When the cycle's measured traffic reaches
+        `monthly_mb`, bulk traffic (screenshots, artifacts, metrics) pauses until the cycle
+        resets; check-ins, config, acks and command results always continue.
+      properties:
+        monthly_mb: { type: integer, minimum: 0, description: 0 or absent = unlimited }
+        reset_day: { type: integer, minimum: 1, maximum: 28, default: 1, description: Day of month the carrier cycle restarts }
+        soft_pct: { type: integer, minimum: 1, maximum: 99, default: 80, description: Warn (event + dashboard badge) at this percentage }
+
+    AppStatus:
+      type: object
+      required: [state]
+      properties:
+        state: { type: string, enum: [running, loading, idle, error, stopped] }
+        uptime_s: { type: integer }
+        build: { type: string }
+        config_revision: { type: integer }
+        fps: { type: number }
+        message: { type: string, maxLength: 256 }
+        metrics:
+          type: object
+          additionalProperties:
+            oneOf: [{ type: number }, { type: string }, { type: boolean }]
+
+    SystemStats:
+      type: object
+      properties:
+        cpu_pct: { type: number }
+        mem_used_mb: { type: integer }
+        mem_total_mb: { type: integer }
+        disk_free_gb: { type: number }
+        uptime_s: { type: integer }
+        network: { type: string, example: cellular }
+
+    DeviceStatus:
+      type: object
+      properties:
+        device_id: { type: string }
+        connected: { type: boolean, description: Agent has recently reached the server }
+        last_checkin_at: { type: string, format: date-time }
+        config_revision: { type: integer }
+        app: { $ref: '#/components/schemas/AppStatus' }
+        last_heartbeat_age_s: { type: integer }
+        process_running: { type: boolean }
+        restarts: { type: integer }
+
+    EffectiveConfig:
+      type: object
+      required: [revision, etag, data]
+      properties:
+        revision: { type: integer }
+        etag: { type: string }
+        reload_mode: { type: string, enum: [none, watch, trigger, restart], default: watch }
+        data:
+          type: object
+          description: Schemaless JSON owned by the app. Validated against an optional per-project JSON Schema.
+          additionalProperties: true
+        supervisor:
+          $ref: '#/components/schemas/SupervisorConfig'
+        screenshots:
+          $ref: '#/components/schemas/ScreenshotPolicy'
+        budget:
+          $ref: '#/components/schemas/BudgetPolicy'
+
+    SupervisorConfig:
+      type: object
+      description: How the agent supervises the app (agent-consumed, not app-facing).
+      properties:
+        mode:
+          type: string
+          enum: [supervise, monitor]
+          default: supervise
+          description: "`monitor` only observes heartbeats (an old watch script still owns the app)."
+        reload_url:
+          type: string
+          description: 'POSTed {"revision":N} for reload_mode trigger; the app acks via POST /config/ack.'
+        exe: { type: string }
+        args: { type: array, items: { type: string } }
+        workdir: { type: string }
+        env: { type: object, additionalProperties: { type: string } }
+        heartbeat_timeout_s: { type: integer, default: 60 }
+        max_restarts: { type: integer, default: 3 }
+        restart_window_s: { type: integer, default: 600 }
+        scheduled_restart: { type: string, example: "04:00", description: Local HH:MM }
+        quit_timeout_s:
+          type: integer
+          minimum: 0
+          maximum: 600
+          default: 10
+          description: How long the app gets to exit after being asked before it is killed. A hung app is only given min(this, 3) seconds.
+        stop_app_on_agent_exit:
+          type: boolean
+          default: false
+          description: |
+            Quit the app when the agent stops. By default the app keeps running, so upgrading or
+            restarting the agent does not interrupt the display, and the next agent adopts the
+            running app instead of launching another.
+
+    ConfigAck:
+      type: object
+      required: [revision, ok]
+      properties:
+        revision: { type: integer }
+        ok: { type: boolean }
+        error: { type: string }
+        rolled_back_to: { type: integer }
+
+    Event:
+      type: object
+      required: [type]
+      properties:
+        ts: { type: string, format: date-time }
+        type: { type: string, example: app.crash }
+        level: { type: string, enum: [debug, info, warn, error], default: info }
+        message: { type: string }
+        data: { type: object, additionalProperties: true }
+
+    Metric:
+      type: object
+      required: [name, value]
+      properties:
+        ts: { type: string, format: date-time }
+        name: { type: string }
+        value: { type: number }
+        tags: { type: object, additionalProperties: { type: string } }
+
+    Command:
+      type: object
+      required: [id, type]
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum: [restart_app, reboot, capture_screenshot, fetch_logs, run_script, checkin_now]
+        params: { type: object, additionalProperties: true }
+        expires_at: { type: string, format: date-time }
+        status: { type: string, enum: [queued, delivered, running, succeeded, failed, expired] }
+        signed:
+          allOf: [{ $ref: '#/components/schemas/SignedEnvelope' }]
+          description: Envelope over a `SignedCommand`. A strict agent ignores the other fields and runs what is in here.
+
+    ScriptInfo:
+      type: object
+      properties:
+        id: { type: string }
+        project: { type: string }
+        name: { type: string }
+        version: { type: integer }
+        interpreter: { type: string, enum: [powershell, cmd, bash, sh, python] }
+        description: { type: string }
+        timeout_s: { type: integer }
+        sha256: { type: string, description: Hash of the exact bytes a device will run }
+        size: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+
+    ScriptCreate:
+      type: object
+      required: [name, interpreter, content]
+      properties:
+        name: { type: string }
+        interpreter: { type: string, enum: [powershell, cmd, bash, sh, python] }
+        content: { type: string, description: 256 KB at most }
+        description: { type: string }
+        timeout_s: { type: integer, default: 120, maximum: 3600 }
+
+    RolloutRequest:
+      type: object
+      required: [type, devices]
+      properties:
+        type: { type: string, enum: [apply_release, run_script] }
+        params: { type: object, additionalProperties: true, description: "As for the command: `{release_id}` or `{script, args?}`" }
+        devices: { type: array, maxItems: 500, items: { type: string }, description: The first `canary` of them go first }
+        canary: { type: integer, minimum: 1, default: 1 }
+        soak_s: { type: integer, minimum: 0, maximum: 86400, default: 120 }
+        batch: { type: integer, minimum: 0, default: 0, description: Devices per wave after the canary; 0 sends to all the rest }
+
+    Rollout:
+      type: object
+      properties:
+        id: { type: string }
+        project: { type: string }
+        type: { type: string }
+        params: { type: object, additionalProperties: true }
+        targets: { type: array, items: { type: string } }
+        canary: { type: integer }
+        soak_s: { type: integer }
+        batch: { type: integer }
+        state: { type: string, enum: [canary, soaking, rolling, done, halted] }
+        reason: { type: string, description: Why it halted }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+        devices:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              stage: { type: string, enum: [canary, rest] }
+              status: { type: string, enum: [waiting, queued, delivered, succeeded, failed, expired, removed] }
+              result: { type: string }
+              command: { type: string }
+
+    ReleaseInfo:
+      type: object
+      properties:
+        id: { type: string }
+        project: { type: string }
+        kind: { type: string, enum: [app, agent] }
+        name: { type: string }
+        version: { type: string }
+        os: { type: string }
+        arch: { type: string }
+        size: { type: integer, format: int64 }
+        sha256: { type: string }
+        notes: { type: string }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+
+    CommandRequest:
+      type: object
+      required: [type]
+      description: |
+        Two command types take a reference, not content. The server looks the reference up and
+        signs the hash it finds, so what the caller sends cannot change what a device runs.
+
+        `run_script` (project admin): `params: { script: <name or id>, version?: <n>, args?: [<text>] }`.
+        Signed parameters: `script_id, name, version, interpreter, sha256, size, timeout_s, args`.
+        The device runs it with a time limit, at low priority, one at a time, and reports the exit
+        code and the start and end of the output.
+
+        `apply_release` (project admin): `params: { release_id, health_s? }`. The release must match
+        the device's OS and architecture. Signed parameters: `release_id, kind, name, version,
+        sha256, size, health_s?`. An app release is unpacked, the app is restarted on it and judged
+        healthy after `health_s` seconds (default 45) of staying up, otherwise the previous build is
+        put back. An agent release is smoke-tested, swapped in and the agent restarts; a build that
+        never reaches a check-in is replaced by the previous one after three starts.
+      properties:
+        type: { type: string }
+        params: { type: object, additionalProperties: true }
+        ttl_s: { type: integer, default: 3600 }
+
+    CommandResult:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        output: { type: string, maxLength: 8192 }
+        artifact_id: { type: string }
+
+    ArtifactInit:
+      type: object
+      required: [client_id, kind, size, sha256]
+      properties:
+        client_id: { type: string, maxLength: 64, description: Chosen by the agent; makes creation idempotent so a retry resumes instead of duplicating }
+        kind: { type: string, enum: [screenshot, log, other] }
+        size: { type: integer, format: int64, maximum: 26214400 }
+        content_type: { type: string, default: application/octet-stream }
+        sha256: { type: string, pattern: '^[0-9a-fA-F]{64}$', description: Checked by the server when the last byte arrives }
+        captured_at: { type: string, format: date-time }
+        meta: { type: object, additionalProperties: true }
+
+    ArtifactSession:
+      type: object
+      properties:
+        id: { type: string }
+        offset: { type: integer, format: int64, description: Bytes the server already has }
+        complete: { type: boolean }
+
+    ArtifactInfo:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        size: { type: integer, format: int64 }
+        content_type: { type: string }
+        captured_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        meta: { type: object, additionalProperties: true }
+
+    Project:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+
+    ProjectView:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        role: { type: string, enum: [viewer, operator, admin], description: The caller's role in this project }
+
+    UserView:
+      type: object
+      properties:
+        id: { type: string }
+        username: { type: string }
+        display_name: { type: string }
+        is_admin: { type: boolean, description: Server administrator }
+        disabled: { type: boolean }
+        has_password: { type: boolean, description: false for token-only accounts }
+        created_at: { type: string, format: date-time }
+        last_login: { type: string, format: date-time }
+        projects: { type: object, additionalProperties: { type: string }, description: "project id -> role (list endpoint only)" }
+
+    Member:
+      type: object
+      properties:
+        username: { type: string }
+        display_name: { type: string }
+        role: { type: string, enum: [viewer, operator, admin] }
+        disabled: { type: boolean }
+
+    TokenInfo:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        last_used: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        time: { type: string, format: date-time }
+        username: { type: string }
+        action: { type: string, example: config.put }
+        project: { type: string }
+        target: { type: string }
+        detail: { type: string }
+
+    ConfigDocument:
+      type: object
+      required: [data]
+      properties:
+        data: { type: object, additionalProperties: true }
+        reload_mode: { type: string, enum: [none, watch, trigger, restart] }
+        supervisor: { $ref: '#/components/schemas/SupervisorConfig' }
+        screenshots:
+          $ref: '#/components/schemas/ScreenshotPolicy'
+        budget:
+          $ref: '#/components/schemas/BudgetPolicy'
+
+    DevicePatch:
+      type: object
+      properties:
+        name: { type: string }
+        tags: { type: array, items: { type: string } }
+
+    DeviceDetail:
+      allOf:
+        - $ref: '#/components/schemas/DeviceSummary'
+        - type: object
+          properties:
+            arch: { type: string }
+            enrolled_at: { type: string, format: date-time }
+            app: { $ref: '#/components/schemas/AppStatus' }
+            system: { $ref: '#/components/schemas/SystemStats' }
+            bytes_in: { type: integer, format: int64, description: Current data-budget cycle }
+            bytes_out: { type: integer, format: int64 }
+            budget_mb: { type: integer }
+            effective: { $ref: '#/components/schemas/EffectiveConfig' }
+            trust: { $ref: '#/components/schemas/TrustReport' }
+            events:
+              type: array
+              description: Newest first, up to 100.
+              items: { $ref: '#/components/schemas/Event' }
+            commands:
+              type: array
+              items: { $ref: '#/components/schemas/Command' }
+            metrics:
+              type: object
+              description: Latest value per metric name.
+              additionalProperties: { type: number }
+
+    DeviceSummary:
+      type: object
+      properties:
+        app_message: { type: string }
+        budget_state: { type: string, enum: [none, ok, soft, exhausted] }
+        restarts: { type: integer, description: App restarts reported by the agent (cumulative) }
+        id: { type: string }
+        name: { type: string }
+        hostname: { type: string }
+        os: { type: string }
+        tags: { type: array, items: { type: string } }
+        agent_version: { type: string }
+        reachability: { type: string, enum: [online, stale, offline] }
+        app_state: { type: string }
+        last_seen_at: { type: string, format: date-time }
+        desired_revision: { type: integer }
+        reported_revision: { type: integer }
+        in_sync: { type: boolean }
+        signature_state:
+          type: string
+          enum: [strict, legacy, rejecting, unknown]
+          description: "`rejecting` = the agent refused something signed wrongly in the last 24 hours and has not accepted a good config since."

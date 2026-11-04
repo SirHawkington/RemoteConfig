@@ -1,0 +1,26 @@
+{
+  "name": "com.remoteconfig.client",
+  "displayName": "RemoteConfig Client",
+  "version": "0.1.0",
+  "unity": "6000.0",
+  "description": "Client for the RemoteConfig agent: live config with hot reload, app heartbeat, metrics and events, and a graceful quit hook. Zero code when the app is launched by the agent.",
+  "keywords": [
+    "remote config",
+    "kiosk",
+    "heartbeat",
+    "monitoring",
+    "installation"
+  ],
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.1",
+    "com.unity.modules.unitywebrequest": "1.0.0",
+    "com.unity.modules.imgui": "1.0.0"
+  },
+  "samples": [
+    {
+      "displayName": "Test Scene",
+      "description": "A scene driven by remote config: background colour, spinning cube and title text change live, with buttons to send metrics, events and state changes.",
+      "path": "Samples~/TestScene"
+    }
+  ]
+}

@@ -485,6 +485,14 @@ func TestACommandReplayedAfterARestartDoesNotRunTwice(t *testing.T) {
 	// the agent restarts (new process, same state directory) and the attacker replays the capture
 	e.stop()
 	e2 := restartAgent(t, e)
+	// Run loads the identity first and the record of executed commands a moment later. In real
+	// life no command can arrive in between (nothing is fetched until startup is done), but this
+	// test hands one over directly, so it must wait for that record to be loaded.
+	wait(t, "the restarted agent to load its record of executed commands", 10*time.Second, func() bool {
+		e2.agent.mu.Lock()
+		defer e2.agent.mu.Unlock()
+		return e2.agent.handled[cmd.ID]
+	})
 	e2.cap.set(noiseShot(0, 64, 36, 1))
 	e2.agent.runCommand(context.Background(), cmd)
 	if e2.cap.count() != 0 {
